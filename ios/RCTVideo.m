@@ -15,6 +15,7 @@ static NSString *const timedMetadata = @"timedMetadata";
 {
   AVPlayer *_player;
   AVPlayerItem *_playerItem;
+  AVURLAsset *asset;
   BOOL _playerItemObserversSet;
   BOOL _playerBufferEmpty;
   AVPlayerLayer *_playerLayer;
@@ -68,6 +69,7 @@ static NSString *const timedMetadata = @"timedMetadata";
     _playInBackground = false;
     _playWhenInactive = false;
     _ignoreSilentSwitch = @"inherit"; // inherit, ignore, obey
+    _videoSaved = NO;
 
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(applicationWillResignActive:)
@@ -93,7 +95,7 @@ static NSString *const timedMetadata = @"timedMetadata";
     playerLayer.showsPlaybackControls = NO;
     playerLayer.rctDelegate = self;
     playerLayer.view.frame = self.bounds;
-    playerLayer.player = player;
+    playerLayer.player = _player;
     playerLayer.view.frame = self.bounds;
     return playerLayer;
 }
@@ -124,17 +126,6 @@ static NSString *const timedMetadata = @"timedMetadata";
     return (kCMTimeRangeZero);
 }
 
--(void)addPlayerTimeObserver
-{
-  const Float64 progressUpdateIntervalMS = _progressUpdateInterval / 1000;
-  // @see endScrubbing in AVPlayerDemoPlaybackViewController.m
-  // of https://developer.apple.com/library/ios/samplecode/AVPlayerDemo/Introduction/Intro.html
-  __weak RCTVideo *weakSelf = self;
-  _timeObserver = [_player addPeriodicTimeObserverForInterval:CMTimeMakeWithSeconds(progressUpdateIntervalMS, NSEC_PER_SEC)
-                                                        queue:NULL
-                                                   usingBlock:^(CMTime time) { [weakSelf sendProgressUpdate]; }
-                   ];
-}
 
 /* Cancels the previously registered time observer. */
 -(void)removePlayerTimeObserver
@@ -151,8 +142,8 @@ static NSString *const timedMetadata = @"timedMetadata";
 - (void)dealloc
 {
   [[NSNotificationCenter defaultCenter] removeObserver:self];
-  [self removePlayerLayer];
   [self removePlayerItemObservers];
+  [self removePlayerLayer];
   [_player removeObserver:self forKeyPath:playbackRate context:nil];
 }
 
@@ -263,6 +254,9 @@ static NSString *const timedMetadata = @"timedMetadata";
  * observer set */
 - (void)removePlayerItemObservers
 {
+  if (_playerLayer) {
+    [_playerLayer removeObserver:self forKeyPath:readyForDisplayKeyPath];
+  }
   if (_playerItemObserversSet) {
     [_playerItem removeObserver:self forKeyPath:statusKeyPath];
     [_playerItem removeObserver:self forKeyPath:playbackBufferEmptyKeyPath];
@@ -276,13 +270,13 @@ static NSString *const timedMetadata = @"timedMetadata";
 
 - (void)setSrc:(NSDictionary *)source
 {
-  [self removePlayerLayer];
   [self removePlayerTimeObserver];
   [self removePlayerItemObservers];
   _playerItem = [self playerItemForSource:source];
   [self addPlayerItemObservers];
 
   [_player pause];
+  [self removePlayerLayer];
   [_playerViewController.view removeFromSuperview];
   _playerViewController = nil;
 
@@ -297,7 +291,13 @@ static NSString *const timedMetadata = @"timedMetadata";
   [_player addObserver:self forKeyPath:playbackRate options:0 context:nil];
   _playbackRateObserverRegistered = YES;
 
-  [self addPlayerTimeObserver];
+  const Float64 progressUpdateIntervalMS = _progressUpdateInterval / 1000;
+  // @see endScrubbing in AVPlayerDemoPlaybackViewController.m of https://developer.apple.com/library/ios/samplecode/AVPlayerDemo/Introduction/Intro.html
+  __weak RCTVideo *weakSelf = self;
+  _timeObserver = [_player addPeriodicTimeObserverForInterval:CMTimeMakeWithSeconds(progressUpdateIntervalMS, NSEC_PER_SEC)
+                                                        queue:NULL
+                                                   usingBlock:^(CMTime time) { [weakSelf sendProgressUpdate]; }
+                   ];
 
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
     //Perform on next run loop, otherwise onVideoLoadStart is nil
@@ -327,11 +327,12 @@ static NSString *const timedMetadata = @"timedMetadata";
 
   if (isNetwork) {
     NSArray *cookies = [[NSHTTPCookieStorage sharedHTTPCookieStorage] cookies];
-    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:@{AVURLAssetHTTPCookiesKey : cookies}];
+    asset = [AVURLAsset URLAssetWithURL:url options:@{AVURLAssetHTTPCookiesKey : cookies}];
+    [asset.resourceLoader setDelegate:self queue:dispatch_get_main_queue()];
     return [AVPlayerItem playerItemWithAsset:asset];
   }
   else if (isAsset) {
-    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:url options:nil];
+    asset = [AVURLAsset URLAssetWithURL:url options:nil];
     return [AVPlayerItem playerItemWithAsset:asset];
   }
 
@@ -462,17 +463,10 @@ static NSString *const timedMetadata = @"timedMetadata";
 - (void)attachListeners
 {
   // listen for end of file
-  [[NSNotificationCenter defaultCenter] removeObserver:self
-                                                  name:AVPlayerItemDidPlayToEndTimeNotification
-                                                object:[_player currentItem]];
   [[NSNotificationCenter defaultCenter] addObserver:self
                                            selector:@selector(playerItemDidReachEnd:)
                                                name:AVPlayerItemDidPlayToEndTimeNotification
                                              object:[_player currentItem]];
-
-  [[NSNotificationCenter defaultCenter] removeObserver:self
-                                                  name:AVPlayerItemPlaybackStalledNotification
-                                                object:nil];
   [[NSNotificationCenter defaultCenter] addObserver:self
                                            selector:@selector(playbackStalled:)
                                                name:AVPlayerItemPlaybackStalledNotification
@@ -497,9 +491,29 @@ static NSString *const timedMetadata = @"timedMetadata";
     AVPlayerItem *item = [notification object];
     [item seekToTime:kCMTimeZero];
     [self applyModifiers];
-  } else {
-    [self removePlayerTimeObserver];
   }
+
+  if (self.onVideoSaved && !self.videoSaved) {
+    AVAssetExportSession *exporter = [[AVAssetExportSession alloc] initWithAsset:asset presetName:AVAssetExportPresetPassthrough];
+
+    NSString *fileName = [NSString stringWithFormat:@"%@.mp4", [[NSUUID UUID] UUIDString]];
+    NSString *filePath = [NSTemporaryDirectory() stringByAppendingPathComponent:fileName];
+    NSURL *outputURL = [NSURL fileURLWithPath:filePath];
+
+    exporter.outputURL = outputURL;
+    exporter.outputFileType = AVFileTypeMPEG4;
+
+    [exporter exportAsynchronouslyWithCompletionHandler:^(void)
+     {
+       dispatch_async(dispatch_get_main_queue(), ^{
+         NSLog(@"RCTVideo export complete. Status %ld, error: %@", (long)exporter.status, exporter.error);
+         _videoSaved = YES;
+         self.onVideoSaved(@{ @"target": self.reactTag,
+                              @"outputPath": filePath });
+       });
+     }];
+  }
+
 }
 
 #pragma mark - Prop setters
@@ -578,12 +592,7 @@ static NSString *const timedMetadata = @"timedMetadata";
     if (CMTimeCompare(current, cmSeekTime) != 0) {
       if (!wasPaused) [_player pause];
       [_player seekToTime:cmSeekTime toleranceBefore:tolerance toleranceAfter:tolerance completionHandler:^(BOOL finished) {
-        if (!_timeObserver) {
-          [self addPlayerTimeObserver];
-        }
-        if (!wasPaused) {
-            [self setPaused:false];
-        }
+        if (!wasPaused) [_player play];
         if(self.onVideoSeek) {
             self.onVideoSeek(@{@"currentTime": [NSNumber numberWithFloat:CMTimeGetSeconds(item.currentTime)],
                                @"seekTime": [NSNumber numberWithFloat:seekTime],
@@ -743,18 +752,17 @@ static NSString *const timedMetadata = @"timedMetadata";
 - (void)setProgressUpdateInterval:(float)progressUpdateInterval
 {
   _progressUpdateInterval = progressUpdateInterval;
-
-  if (_timeObserver) {
-    [self removePlayerTimeObserver];
-    [self addPlayerTimeObserver];
-  }
 }
 
 - (void)removePlayerLayer
 {
-    [_playerLayer removeFromSuperlayer];
+  [_playerLayer removeFromSuperlayer];
+
+  @try {
     [_playerLayer removeObserver:self forKeyPath:readyForDisplayKeyPath];
-    _playerLayer = nil;
+  } @catch (NSException *e) { }
+
+  _playerLayer = nil;
 }
 
 #pragma mark - RCTVideoPlayerViewControllerDelegate
